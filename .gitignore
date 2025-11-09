@@ -1,0 +1,38 @@
+# --- ENTORNOS VIRTUALES ---
+env/
+env0/
+venv/
+.venv/
+
+# --- ARCHIVOS TEMPORALES DE PYTHON ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- SISTEMA / EDITOR ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- YOLO / ULTRALYTICS ---
+# Pesos y salidas de entrenamiento
+Modelo_V2/runs/train/*/weights/last.pt
+Modelo_V2/runs/train/*/weights/*.onnx
+Modelo_V2/runs/train/*/weights/*.engine
+Modelo_V2/runs/detect/
+
+# Datasets locales
+data/
+Modelo_V2/data/train/
+Modelo_V2/data/val/
+Modelo_V2/data/test/
+
+# --- LOGS / CACHE ---
+*.log
+*.cache
+*.tmp
+
+# --- ARCHIVOS GRANDES / PRIVADOS ---
+vault/
