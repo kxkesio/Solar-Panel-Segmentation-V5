@@ -2,3 +2,6 @@ PyQt6
 pandas
 pillow
 openpyxl
+opencv-python
+uuid
+exifread
