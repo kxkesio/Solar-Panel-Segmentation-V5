@@ -53,7 +53,7 @@ pip install -r requirements.txt
 
 ## 👨‍💻 Autor
 
-Enrique Leyton — Pretec / Proyecto académico PDT  
+Enrique Leyton — Proyecto académico PDT  
 Contacto: https://github.com/kxkesio
 
 ---
