@@ -128,7 +128,7 @@ def procesar_imagen(image_path,
     preprocesar_imagen(image_path, preprocessed_path)
 
     # --- Ejecutar predicción ---
-    results = model.predict(image_path=preprocessed_path, show=True, conf=0.5)
+    results = model.predict(source=preprocessed_path, show=True, conf=0.5)
 
     # --- Leer imagen preprocesada (la usada por el modelo) ---
     img_pred = cv2.imread(preprocessed_path)

@@ -5,3 +5,4 @@ openpyxl
 opencv-python
 uuid
 exifread
+ultralytics
