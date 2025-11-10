@@ -6,13 +6,11 @@ import math
 import exifread
 import requests
 import pandas as pd
-from roboflow import Roboflow
+from ultralytics import YOLO
 from PIL import Image, ImageEnhance
 
-# Inicializa Roboflow
-rf = Roboflow(api_key="xKaCtPip3o6zzKkw57JJ")
-project = rf.workspace().project("pdt_01-jpzwx")
-model = project.version(1).model
+# Carga modelo entrenado localmente
+model = YOLO("Modelo_V2/runs/train/names3/weights/best.pt")
 
 def extract_gps_from_exif(image_path):
     with open(image_path, 'rb') as f:
@@ -98,7 +96,7 @@ def preprocesar_imagen(image_path, output_path=None, max_size=1600, quality=90):
         image = image.resize(new_size, Image.LANCZOS)
 
     # --- Conversión a escala de grises ---
-    image = image.convert("L")  # 'L' = grayscale
+    # image = image.convert("L")  # 'L' = grayscale
 
     # --- Mejoras de imagen ---
     image = ImageEnhance.Contrast(image).enhance(1.5)
@@ -130,7 +128,7 @@ def procesar_imagen(image_path,
     preprocesar_imagen(image_path, preprocessed_path)
 
     # --- Ejecutar predicción ---
-    results = model.predict(image_path=preprocessed_path, confidence=40)
+    results = model.predict(source=preprocessed_path, show=True, conf=0.5)
 
     # --- Leer imagen preprocesada (la usada por el modelo) ---
     img_pred = cv2.imread(preprocessed_path)
