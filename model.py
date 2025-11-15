@@ -1,20 +1,91 @@
-# FondefSolarPanels/main.py
+# ============================================================
+#                     model.py (VERSIÓN SIMPLE FILTRO)
+# ============================================================
+
 import os
 import cv2
 import uuid
 import math
+import glob
+import shutil
 import exifread
-import requests
 import pandas as pd
+from datetime import datetime
 from ultralytics import YOLO
 from PIL import Image, ImageEnhance
 
-# Carga modelo entrenado localmente
+from utils import (
+    get, merge_panels, bbox_center_w_h,
+    meters_per_deg, deg_offsets_from_m,
+    pixel_to_meter_scale_from_cone,
+    haversine_m
+)
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CONE_REAL_WIDTH_M = 0.28
+MERGE_RADIUS_M = 0.6
+USE_FOV_FALLBACK_IF_NO_CONE = True
+
+# directorio para imágenes filtradas
+OUTPUT_FILTERED_BASE = os.path.join("data", "img_filtradas")
+
 model = YOLO("Modelo_V2/runs/train/names3/weights/best.pt")
 
+
+# ============================================================
+# UTILIDADES BÁSICAS
+# ============================================================
+
+def generar_id():
+    return f"PNL_{uuid.uuid4().hex[:8].upper()}"
+
+
+# ============================================================
+# FILTRADO SIMPLE PRE-BATCH (1 SÍ, 2 NO)
+# ============================================================
+
+def filtrar_imagenes_simple(input_dir, output_dir):
+    """
+    Toma 1 imagen, descarta las siguientes 2.
+    Mantiene: 1, 4, 7, 10, ... en el orden original.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    imagenes = sorted([
+        f for f in os.listdir(input_dir)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ])
+
+    if not imagenes:
+        print(f"[Filtro simple] ⚠️ No se encontraron imágenes en {input_dir}")
+        return []
+
+    kept_paths = []
+    counter = 0
+
+    for fname in imagenes:
+        if counter % 3 == 0:  # 1 sí, 2 no
+            src = os.path.join(input_dir, fname)
+            dst = os.path.join(output_dir, fname)
+            shutil.copy2(src, dst)
+            kept_paths.append(dst)
+        counter += 1
+
+    print(f"[Filtro simple] {len(kept_paths)} imágenes seleccionadas.")
+    return kept_paths
+
+
+# ============================================================
+# GPS / EXIF
+# ============================================================
+
 def extract_gps_from_exif(image_path):
-    with open(image_path, 'rb') as f:
-        tags = exifread.process_file(f)
+    with open(image_path, "rb") as f:
+        tags = exifread.process_file(f, details=True)
+
     try:
         lat_ref = tags["GPS GPSLatitudeRef"].values
         lon_ref = tags["GPS GPSLongitudeRef"].values
@@ -22,243 +93,383 @@ def extract_gps_from_exif(image_path):
         lon = tags["GPS GPSLongitude"].values
         alt = tags["GPS GPSAltitude"].values[0]
 
-        def to_degrees(value):
-            return float(value[0].num) / float(value[0].den) + \
-                   float(value[1].num) / float(value[1].den) / 60 + \
-                   float(value[2].num) / float(value[2].den) / 3600
-        
-        lat = to_degrees(lat)
-        lon = to_degrees(lon)
-        altitude = float(alt.num) / float(alt.den) if alt else 0.0
+        def conv(v):
+            return float(v[0].num)/v[0].den + \
+                   float(v[1].num)/v[1].den/60 + \
+                   float(v[2].num)/v[2].den/3600
 
-        if lat_ref != 'N': lat = -lat
-        if lon_ref != 'E': lon = -lon
-        
-        return lat, lon, altitude
-    
-    except KeyError as e:
-        print(f"[!] No se pudo extraer {e} desde {image_path}")
+        lat = conv(lat)
+        lon = conv(lon)
+        alt_m = float(alt.num)/alt.den if alt else 3.0
+
+        if lat_ref != "N":
+            lat = -lat
+        if lon_ref != "E":
+            lon = -lon
+
+        return lat, lon, alt_m
+    except:
         return None, None, None
 
-def generar_id():
-    return f"PNL_{uuid.uuid4().hex[:8].upper()}"
 
-def obtener_elevacion(lat, lon):
-    url = f"https://api.open-elevation.com/api/v1/lookup?locations={lat},{lon}"
+def leer_timestamp(image_path):
     try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            print(f"Elevation ground {response.json()['results'][0]['elevation']}")
-            return response.json()['results'][0]['elevation'] # en metros
+        with open(image_path, "rb") as f:
+            tags = exifread.process_file(f, details=False)
+            if "EXIF DateTimeOriginal" in tags:
+                t = str(tags["EXIF DateTimeOriginal"])
+                return datetime.strptime(t, "%Y:%m:%d %H:%M:%S")
     except:
         pass
-    return None
+    return datetime.fromtimestamp(os.path.getmtime(image_path))
 
-def calcular_cobertura_en_metros(alt_relat, sensor_mm=6.3, focal_mm=4.5, img_w=4000, img_h=3000):
-    hfov_rad = 2 * math.atan(sensor_mm / (2 * focal_mm))
-    vfov_rad = hfov_rad * (img_h / img_w)
 
-    width_m = 2 * alt_relat * math.tan(hfov_rad / 2)
-    height_m = 2 * alt_relat * math.tan(vfov_rad / 2)
+# ============================================================
+# RUMBO (BEARING)
+# ============================================================
 
-    return width_m, height_m
+def rumbo_dron(lat1, lon1, lat2, lon2):
+    lat1r = math.radians(lat1)
+    lat2r = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
 
-def calcular_posicion_panel(lat, lon, img_w, img_h, bbox, width_m, height_m):
-    deg_por_m = 0.00001
+    y = math.sin(dlon) * math.cos(lat2r)
+    x = math.cos(lat1r)*math.sin(lat2r) - math.sin(lat1r)*math.cos(lat2r)*math.cos(dlon)
 
-    x_center = bbox['x'] / img_w
-    y_center = bbox['y'] / img_h
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360) % 360
 
-    offset_lat = (0.5 - y_center) * height_m * deg_por_m
-    offset_lon = (x_center - 0.5) * width_m * deg_por_m
 
-    return lat + offset_lat, lon + offset_lon
+# ============================================================
+# PREPROCESAMIENTO DE IMAGEN
+# ============================================================
 
-from PIL import Image, ImageEnhance
+def preprocesar_imagen(path, out_path="data/preprocessed.jpg", max_size=1600):
+    img = Image.open(path)
+    w, h = img.size
 
-def preprocesar_imagen(image_path, output_path=None, max_size=1600, quality=90):
-    """
-    Preprocesa una imagen para análisis:
-    - Convierte a escala de grises.
-    - Mejora contraste, brillo y nitidez.
-    - Redimensiona automáticamente si excede max_size.
-    - Comprime para evitar errores HTTP 413 (imagen demasiado grande).
-    """
-
-    # Abrir imagen
-    image = Image.open(image_path)
-
-    # --- Reducción de tamaño si es muy grande ---
-    w, h = image.size
     if max(w, h) > max_size:
         scale = max_size / max(w, h)
-        new_size = (int(w * scale), int(h * scale))
-        image = image.resize(new_size, Image.LANCZOS)
+        img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
 
-    # --- Conversión a escala de grises ---
-    # image = image.convert("L")  # 'L' = grayscale
+    img = ImageEnhance.Contrast(img).enhance(1.3)
+    img = ImageEnhance.Brightness(img).enhance(1.1)
+    img = ImageEnhance.Sharpness(img).enhance(1.5)
 
-    # --- Mejoras de imagen ---
-    image = ImageEnhance.Contrast(image).enhance(1.5)
-    image = ImageEnhance.Brightness(image).enhance(1.2)
-    image = ImageEnhance.Sharpness(image).enhance(2.0)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    img.save(out_path, "JPEG", quality=90, optimize=True)
 
-    # --- Guardar versión procesada (si corresponde) ---
-    if output_path:
-        # Asegura que la carpeta destino exista
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        # Guarda en formato JPEG comprimido
-        image.save(output_path, format="JPEG", quality=quality, optimize=True)
-
-    return image
+    return out_path
 
 
-def get(pred, key):
-    """Compatibilidad entre dict y objeto Prediction"""
-    if isinstance(pred, dict):
-        return pred.get(key)
-    return getattr(pred, key, None)
+# ============================================================
+# FOV (cuando no hay cono)
+# ============================================================
 
-def procesar_imagen(image_path, 
-                    string_id,
-                    debug=False
-                    ):
-    # --- Preprocesamiento ---
-    preprocessed_path = "data/preprocessed.jpg"
-    preprocesar_imagen(image_path, preprocessed_path)
+def calcular_cobertura_en_metros(alt, sensor_mm=6.3, focal_mm=4.5, img_w=4000, img_h=3000):
+    hfov = 2 * math.atan(sensor_mm / (2 * focal_mm))
+    vfov = hfov * (img_h / img_w)
 
-    # --- Ejecutar predicción ---
-    results = model.predict(source=preprocessed_path, show=True, conf=0.5)
+    w_m = 2 * alt * math.tan(hfov / 2)
+    h_m = 2 * alt * math.tan(vfov / 2)
+    return w_m, h_m
 
-    # --- Leer imagen preprocesada (la usada por el modelo) ---
-    img_pred = cv2.imread(preprocessed_path)
-    H_pred, W_pred = img_pred.shape[:2]
 
-   # --- Determinar estructura de resultados ---
-    if hasattr(results, "json"):  # Roboflow API
-        predictions = results.json().get("predictions", [])
-    elif isinstance(results, list) and hasattr(results[0], "boxes"):  # YOLO local
-        boxes = results[0].boxes.xyxy.cpu().numpy()
-        confs = results[0].boxes.conf.cpu().numpy()
-        classes = results[0].boxes.cls.cpu().numpy()
-        predictions = []
-        for (x1, y1, x2, y2), conf, cls in zip(boxes, confs, classes):
-            predictions.append({
-                "x": (x1 + x2) / 2,
-                "y": (y1 + y2) / 2,
-                "width": x2 - x1,
-                "height": y2 - y1,
-                "confidence": float(conf),
-                "class": results[0].names[int(cls)]
-            })
-    else:
-        print("[!] Formato de resultados no reconocido.")
+# ============================================================
+# PROCESAR UNA SOLA IMAGEN (con rumbo + corrección roll)
+# ============================================================
+
+def procesar_imagen(image_path, string_id, debug=False, rumbo=None):
+
+    # ------------------------------------
+    # Preprocesamiento
+    # ------------------------------------
+    pre = preprocesar_imagen(image_path)
+    img_pred = cv2.imread(pre)
+    H, W = img_pred.shape[:2]
+
+    # ------------------------------------
+    # YOLO
+    # ------------------------------------
+    results = model.predict(pre, show=False, conf=0.5)
+
+    if not (isinstance(results, list) and hasattr(results[0], "boxes")):
+        print("[YOLO] Error leyendo cajas")
         return
 
-    if debug:
-        print("\n--- Estructura real de la primera predicción ---")
-        import json
-        print(json.dumps(predictions[0], indent=2))
-        print("----------------------------------------------\n")
-        print(f"Detecciones totales: {len(predictions)}")
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+    confs = results[0].boxes.conf.cpu().numpy()
+    clss = results[0].boxes.cls.cpu().numpy()
 
-    # --- Filtro: eliminar paneles cortados ---
-    filtered_preds = []
-    for pred in predictions:
-        x = get(pred, "x")
-        y = get(pred, "y")
-        w = get(pred, "width")
-        h = get(pred, "height")
-        cls = get(pred, "class")
-        conf = get(pred, "confidence")
+    preds = []
+    for (x1, y1, x2, y2), c, cls_id in zip(boxes, confs, clss):
+        preds.append({
+            "x": (x1 + x2) / 2,
+            "y": (y1 + y2) / 2,
+            "width": x2 - x1,
+            "height": y2 - y1,
+            "confidence": float(c),
+            "class": results[0].names[int(cls_id)]
+        })
 
-        if None in [x, y, w, h, cls, conf]:
-            continue
-
+    # ------------------------------------
+    # Filtrar bordes
+    # ------------------------------------
+    filtered = []
+    for p in preds:
+        x, y, w, h = p["x"], p["y"], p["width"], p["height"]
         x1, y1, x2, y2 = x - w/2, y - h/2, x + w/2, y + h/2
 
-        # margen relativo al tamaño de la imagen usada para predecir
-        margin_x = W_pred * 0.01
-        margin_y = H_pred * 0.01
-
-        # aplicar filtro
-        if x1 < margin_x or y1 < margin_y or x2 > W_pred - margin_x or y2 > H_pred - margin_y:
+        if x1 < 0.01 * W or y1 < 0.01 * H or x2 > 0.99 * W or y2 > 0.99 * H:
             continue
+        filtered.append(p)
 
-        filtered_preds.append(pred)
+    # separar paneles y conos
+    panels = []
+    cones = []
+    for p in filtered:
+        cname = p["class"].lower()
+        if "panel" in cname:
+            panels.append(p)
+        elif "cono" in cname:
+            cones.append(p)
 
-    if debug:
-        print(f"Detecciones filtradas: {len(filtered_preds)}")
-
-    # --- Dibujar sobre la imagen preprocesada ---
-    for pred in filtered_preds:
-        x = int(get(pred, "x") - get(pred, "width") / 2)
-        y = int(get(pred, "y") - get(pred, "height") / 2)
-        w = int(get(pred, "width"))
-        h = int(get(pred, "height"))
-        class_name = get(pred, "class")
-        conf = get(pred, "confidence")
-
+    # ------------------------------------
+    # Dibujar detecciones en imagen
+    # ------------------------------------
+    for p in filtered:
+        x = int(p["x"] - p["width"] / 2)
+        y = int(p["y"] - p["height"] / 2)
+        w = int(p["width"])
+        h = int(p["height"])
         cv2.rectangle(img_pred, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(img_pred, f"{class_name} {conf:.2f}", (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
-    # Crear carpeta de resultados por string
-    result_folder = os.path.join("data", "resultados", string_id)
-    os.makedirs(result_folder, exist_ok=True)
 
-    # --- Guardar imagen anotada ---
-    output_img_name = f"PRED_{os.path.basename(image_path)}"
-    output_img_path = os.path.join(result_folder, output_img_name)
-    cv2.imwrite(output_img_path, img_pred)
-
-    # --- Extraer GPS ---
+    # ------------------------------------
+    # GPS
+    # ------------------------------------
     lat, lon, alt = extract_gps_from_exif(image_path)
     if lat is None:
-        print(f"[!] Sin datos GPS en {image_path}")
+        print("[GPS] no encontrado")
         return
 
-    elev = obtener_elevacion(lat, lon)
-    alt_relat = alt - elev if elev is not None else alt
-    print(f"Altitud relativa: {alt_relat:.2f} m")
+    alt_relat = alt if alt > 0 else 4
 
-    # --- Calcular cobertura en metros ---
-    width_m, height_m = calcular_cobertura_en_metros(
-        alt_relat, sensor_mm=6.3, focal_mm=4.5, img_w=W_pred, img_h=H_pred)
-    print(f"Cobertura estimada: {width_m:.2f} m x {height_m:.2f} m")
+    # ------------------------------------
+    # Escala por cono
+    # ------------------------------------
+    m_per_px = None
+    if cones:
+        widths = [bbox_center_w_h(c)[2] for c in cones]
+        m_per_px = CONE_REAL_WIDTH_M / max(widths)
 
-    # --- Guardar predicciones ---
+    # FOV fallback
+    width_m_fov, height_m_fov = calcular_cobertura_en_metros(alt_relat, img_w=W, img_h=H)
+
+    # ------------------------------------
+    # ORIGEN: centro inferior
+    # ------------------------------------
+    cx0 = W / 2
+    cy0 = H
+
+    # ============================================================
+    # CÁLCULO GEOMÉTRICO DE TODOS LOS PANELES
+    # ============================================================
+
+    raw_dxdy = []  # puntos (dx, dy) antes del roll
+
+    rumbo_rad = math.radians(rumbo) if rumbo is not None else None
+
+    for p in panels:
+        px, py, _, _ = bbox_center_w_h(p)
+
+        # desplazamiento px
+        dx_px = px - cx0
+        dy_px = cy0 - py   # arriba positivo
+
+        # px -> metros
+        if m_per_px:
+            dx_m = dx_px * m_per_px
+            dy_m = dy_px * m_per_px
+        else:
+            xc = px / W
+            yc = py / H
+            dx_m = (xc - 0.5) * width_m_fov
+            dy_m = (1 - yc) * height_m_fov
+
+        # --------------------------------
+        # corregir dirección (lado izquierdo/derecho)
+        # --------------------------------
+        if rumbo_rad is not None:
+            r = rumbo_rad
+
+            # opción 1
+            dx1 = dx_m * math.cos(r) - dy_m * math.sin(r)
+            dy1 = dx_m * math.sin(r) + dy_m * math.cos(r)
+
+            # opción 2 (gimbal mirando al otro lado)
+            r2 = r + math.pi
+            dx2 = dx_m * math.cos(r2) - dy_m * math.sin(r2)
+            dy2 = dx_m * math.sin(r2) + dy_m * math.cos(r2)
+
+            # dirección de avance real
+            vx, vy = math.cos(r), math.sin(r)
+
+            dot1 = dx1 * vx + dy1 * vy
+            dot2 = dx2 * vx + dy2 * vy
+
+            if dot1 > dot2:
+                raw_dxdy.append((dx1, dy1))
+            else:
+                raw_dxdy.append((dx2, dy2))
+        else:
+            raw_dxdy.append((dx_m, dy_m))
+
+    # ============================================================
+    # CORRECCIÓN DE ROLL (alinear fila dentro del frame)
+    # ============================================================
+
+    if len(raw_dxdy) >= 2:
+        xs = [p[0] for p in raw_dxdy]
+        ys = [p[1] for p in raw_dxdy]
+
+        mean_x = sum(xs) / len(xs)
+        mean_y = sum(ys) / len(ys)
+
+        num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(len(xs)))
+        den = sum((xs[i] - mean_x) ** 2 for i in range(len(xs)))
+        a = num / den if den > 0 else 0.0  # pendiente
+
+        theta = math.atan(a)
+
+        corrected = []
+        for dx, dy in raw_dxdy:
+            dx_c = dx * math.cos(-theta) - dy * math.sin(-theta)
+            dy_c = dx * math.sin(-theta) + dy * math.cos(-theta)
+            corrected.append((dx_c, dy_c))
+    else:
+        corrected = raw_dxdy
+
+    # ============================================================
+    # CONVERTIR A LAT/LON Y GUARDAR
+    # ============================================================
+
     registros = []
-    for pred in filtered_preds:
-        if str(get(pred, "class")).lower() == "panel":
-            adj_lat, adj_lon = calcular_posicion_panel(
-                lat, lon, W_pred, H_pred, pred, width_m, height_m)
-            registros.append({
-                "id_panel": generar_id(),
-                "lat": adj_lat,
-                "lon": adj_lon,
-                "conf": round(get(pred, "confidence"), 2),
-                "image": os.path.basename(image_path)
-            })
+    for (dx_c, dy_c), p in zip(corrected, panels):
+        dlat, dlon = deg_offsets_from_m(lat, dy_c, dx_c)
+        registros.append({
+            "id_panel": generar_id(),
+            "lat": lat + dlat,
+            "lon": lon + dlon,
+            "conf": round(p["confidence"], 3),
+            "image": os.path.basename(image_path)
+        })
 
-    # Archivo Excel global por string
-    excel_path = os.path.join(result_folder, f"resultados_{string_id}.xlsx")
+    # --------------------------------------
+    # Guardar resultados
+    # --------------------------------------
+    folder = os.path.join("data", "resultados", string_id)
+    os.makedirs(folder, exist_ok=True)
+
+    cv2.imwrite(os.path.join(folder, "PRED_" + os.path.basename(image_path)), img_pred)
+
+    excel_path = os.path.join(folder, f"resultados_{string_id}.xlsx")
 
     if registros:
-        df_out = pd.DataFrame(registros)
+        df_new = pd.DataFrame(registros)
+        df_new["images"] = df_new["image"]
 
         if not os.path.exists(excel_path):
-            df_out.to_excel(excel_path, index=False)
-            print(f"[✔] Nuevo archivo Excel creado: {excel_path}")
+            df_new.to_excel(excel_path, index=False)
         else:
-            prev_df = pd.read_excel(excel_path)
-            combined_df = pd.concat([prev_df, df_out], ignore_index=True)
-            combined_df.to_excel(excel_path, index=False)
-            print(f"[✔] Resultados agregados a: {excel_path}")
-        print(f"[✔] {len(registros)} paneles guardados en {excel_path}")
+            df_prev = pd.read_excel(excel_path)
+            if "images" not in df_prev.columns:
+                df_prev["images"] = df_prev["image"]
+
+            merged = df_prev.copy()
+
+            for _, nw in df_new.iterrows():
+                if len(merged) == 0:
+                    merged = pd.concat([merged, pd.DataFrame([nw])], ignore_index=True)
+                    continue
+
+                d = merged.apply(
+                    lambda r: haversine_m(r["lat"], r["lon"], nw["lat"], nw["lon"]),
+                    axis=1
+                )
+                idx = d.idxmin()
+
+                if d.loc[idx] <= MERGE_RADIUS_M:
+                    row = merged.loc[idx].to_dict()
+                    latm, lonm, confm, imgs = merge_panels(row, nw.to_dict())
+                    merged.at[idx, "lat"] = latm
+                    merged.at[idx, "lon"] = lonm
+                    merged.at[idx, "conf"] = confm
+                    merged.at[idx, "images"] = imgs
+                else:
+                    merged = pd.concat([merged, pd.DataFrame([nw])], ignore_index=True)
+
+            merged.to_excel(excel_path, index=False)
+
+    return folder
+
+
+# ============================================================
+# PROCESAR CARPETA COMPLETA (BATCH)
+# ============================================================
+
+def procesar_batch(folder, string_id):
+
+    # 1) Filtrar por lógica simple 1 sí, 2 no
+    OUTPUT_FILTERED = os.path.join(OUTPUT_FILTERED_BASE, string_id)
+    print("\n[Filtro simple] Filtrando imágenes de la carpeta…")
+    filtered_imgs = filtrar_imagenes_simple(
+        input_dir=folder,
+        output_dir=OUTPUT_FILTERED
+    )
+
+    if not filtered_imgs:
+        print("[Filtro simple] No quedaron imágenes tras filtrado")
+        return
+
+    # 2) GPS + timestamps
+    info = []
+    for img in filtered_imgs:
+        lat, lon, alt = extract_gps_from_exif(img)
+        if lat is None:
+            continue
+        ts = leer_timestamp(img)
+        info.append({"path": img, "lat": lat, "lon": lon, "alt": alt, "ts": ts})
+
+    if not info:
+        print("[Batch] Ninguna imagen con GPS válido.")
+        return
+
+    info.sort(key=lambda x: x["ts"])
+
+    # 3) calcular rumbo por pares consecutivos (fix para 1 sola imagen)
+    if len(info) > 1:
+        for i in range(len(info)):
+            if i == 0:
+                info[i]["rumbo"] = rumbo_dron(
+                    info[0]["lat"], info[0]["lon"],
+                    info[1]["lat"], info[1]["lon"]
+                )
+            else:
+                info[i]["rumbo"] = rumbo_dron(
+                    info[i-1]["lat"], info[i-1]["lon"],
+                    info[i]["lat"], info[i]["lon"]
+                )
     else:
-        print(f"[!] No se detectaron paneles en {image_path}")
-    
-    return result_folder
-# MAIN
-# procesar_imagen('data/img_raw_rgb/DJI_20241115111127_0001_V.JPG')
+        info[0]["rumbo"] = 0.0  # rumbo arbitrario si solo hay una imagen
+
+    # 4) procesar cada imagen
+    for item in info:
+        print(f"Procesando {os.path.basename(item['path'])}, rumbo={item['rumbo']}")
+        procesar_imagen(
+            image_path=item["path"],
+            string_id=string_id,
+            debug=False,
+            rumbo=item["rumbo"]
+        )
+
+    print("\n=== Batch finalizado ===")

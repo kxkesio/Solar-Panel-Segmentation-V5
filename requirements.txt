@@ -6,3 +6,4 @@ opencv-python
 uuid
 exifread
 ultralytics
+skimage.metrics
