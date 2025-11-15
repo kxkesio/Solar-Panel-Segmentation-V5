@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import Qt
-from model import procesar_imagen
+from model import procesar_imagen, procesar_batch
 import pandas as pd
 
 
@@ -54,6 +54,12 @@ class SolarDashboard(QWidget):
         self.select_button.setDisabled(True)
         self.select_button.clicked.connect(self.select_image)
         self.layout.addWidget(self.select_button)
+        
+        # Botón para procesar carpeta completa (batch)
+        self.batch_button = QPushButton("Procesar carpeta completa")
+        self.batch_button.setDisabled(True)  # se habilita cuando haya string
+        self.batch_button.clicked.connect(self.select_batch_folder)
+        self.layout.addWidget(self.batch_button)
 
         # Botón para procesar la imagen actual
         self.process_button = QPushButton("Procesar imagen seleccionada")
@@ -69,12 +75,42 @@ class SolarDashboard(QWidget):
 
     ##  ___________________________________ BACK _______________________________  ##
 
+    def select_batch_folder(self):
+        if self.string_id is None:
+            QMessageBox.warning(self, "Error", "Primero debes crear un String.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Seleccionar carpeta con imágenes contiguas"
+        )
+
+        if not folder:
+            return
+
+        QMessageBox.information(self, "Procesando", f"Procesando carpeta:\n{folder}")
+
+        procesar_batch(folder, self.string_id)
+
+        # Recargar Excel del string
+        result_path = os.path.join("data", "resultados", self.string_id)
+        excel_path = os.path.join(result_path, f"resultados_{self.string_id}.xlsx")
+
+        if os.path.exists(excel_path):
+            self.pred_df = pd.read_excel(excel_path)
+            self.show_predictions(None)
+
+        QMessageBox.information(self, "Completado", "Batch procesado exitosamente.")
+
+
+    
     def crear_nuevo_string(self):
         nombre, ok = QInputDialog.getText(self, "Nuevo String", "Ingresa el nombre del nuevo string:")
         if ok and nombre.strip():
             self.string_id = nombre.strip()
             self.string_label.setText(f"String actual: {self.string_id}")
             self.select_button.setDisabled(False)
+            self.batch_button.setDisabled(False)
             QMessageBox.information(self, "String creado", f"Ahora se trabaja en: {self.string_id}")
         else:
             QMessageBox.warning(self, "Error", "Nombre de string no válido.")
@@ -126,7 +162,7 @@ class SolarDashboard(QWidget):
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"No se pudo cargar el archivo Excel:\n{e}")
 
-    def show_predictions(self, image_name):
+    def show_predictions(self, image_name=None):
         if self.pred_df is None:
             self.pred_table.clear()
             self.pred_table.setRowCount(0)
