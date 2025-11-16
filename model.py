@@ -252,7 +252,7 @@ def procesar_imagen(image_path, string_id, debug=False, rumbo=None):
         print("[GPS] no encontrado")
         return
 
-    alt_relat = alt if alt > 0 else 4
+    alt_relat = 4 # incorporar AQUI info EFIX sobe altura relativa al suelo.
 
     # ------------------------------------
     # Escala por cono
@@ -265,12 +265,12 @@ def procesar_imagen(image_path, string_id, debug=False, rumbo=None):
     # FOV fallback
     width_m_fov, height_m_fov = calcular_cobertura_en_metros(alt_relat, img_w=W, img_h=H)
 
-    # ------------------------------------
-    # ORIGEN: centro inferior
-    # ------------------------------------
-    cx0 = W / 2
-    cy0 = H
+    # ============================================================
+    # ORIGEN: centro de la imagen
+    # ============================================================
 
+    cx0 = W/2
+    cy0 = H/2
     # ============================================================
     # CÁLCULO GEOMÉTRICO DE TODOS LOS PANELES
     # ============================================================
@@ -282,47 +282,36 @@ def procesar_imagen(image_path, string_id, debug=False, rumbo=None):
     for p in panels:
         px, py, _, _ = bbox_center_w_h(p)
 
-        # desplazamiento px
-        dx_px = px - cx0
-        dy_px = cy0 - py   # arriba positivo
+        # ------------------------------------
+        # px → metros (origen en centro óptico)
+        # ------------------------------------
+        dx_px = px - cx0           # derecha positivo
+        dy_px = cy0 - py           # arriba positivo  (coincide con ENU local)
 
-        # px -> metros
         if m_per_px:
             dx_m = dx_px * m_per_px
             dy_m = dy_px * m_per_px
-        else:
-            xc = px / W
-            yc = py / H
-            dx_m = (xc - 0.5) * width_m_fov
-            dy_m = (1 - yc) * height_m_fov
 
-        # --------------------------------
-        # corregir dirección (lado izquierdo/derecho)
-        # --------------------------------
+        else:
+            # Normalizar a [-0.5, +0.5]
+            xc = (px - cx0) / W
+            yc = (cy0 - py) / H
+
+            dx_m = xc * width_m_fov
+            dy_m = yc * height_m_fov
+
+        # ------------------------------------
+        # Rotar según rumbo del dron
+        # ------------------------------------
         if rumbo_rad is not None:
             r = rumbo_rad
 
-            # opción 1
-            dx1 = dx_m * math.cos(r) - dy_m * math.sin(r)
-            dy1 = dx_m * math.sin(r) + dy_m * math.cos(r)
-
-            # opción 2 (gimbal mirando al otro lado)
-            r2 = r + math.pi
-            dx2 = dx_m * math.cos(r2) - dy_m * math.sin(r2)
-            dy2 = dx_m * math.sin(r2) + dy_m * math.cos(r2)
-
-            # dirección de avance real
-            vx, vy = math.cos(r), math.sin(r)
-
-            dot1 = dx1 * vx + dy1 * vy
-            dot2 = dx2 * vx + dy2 * vy
-
-            if dot1 > dot2:
-                raw_dxdy.append((dx1, dy1))
-            else:
-                raw_dxdy.append((dx2, dy2))
+            dx_rot = dx_m * math.cos(r) - dy_m * math.sin(r)
+            dy_rot = dx_m * math.sin(r) + dy_m * math.cos(r)
         else:
-            raw_dxdy.append((dx_m, dy_m))
+            dx_rot, dy_rot = dx_m, dy_m
+
+        raw_dxdy.append((dx_rot, dy_rot))
 
     # ============================================================
     # CORRECCIÓN DE ROLL (alinear fila dentro del frame)
@@ -348,13 +337,47 @@ def procesar_imagen(image_path, string_id, debug=False, rumbo=None):
             corrected.append((dx_c, dy_c))
     else:
         corrected = raw_dxdy
+        
+    # ============================================================
+    # CORRECCIÓN DE ORIENTACIÓN LATERAL (90°)
+    # El dron avanza en rumbo, pero la cámara mira de lado
+    # ============================================================
+
+    if rumbo is not None:
+        # La cámara apunta lateralmente:
+        # Si los paneles están a la derecha del centro, la cámara mira al ESTE
+        # Si están a la izquierda, mira al OESTE
+
+        # Determinar orientación según posición promedio
+        # (si dx promedio > 0 → paneles a la derecha → cámara mirando a la derecha)
+        mean_dx = sum(dx for dx, dy in corrected) / len(corrected)
+
+        if mean_dx > 0:
+            # Cámara apuntando a la derecha → rotar +90°
+            rot = math.radians(90)
+        else:
+            # Cámara apuntando a la izquierda → rotar -90°
+            rot = math.radians(-90)
+
+        corrected_rot = []
+        for dx, dy in corrected:
+            dx_r = dx * math.cos(rot) - dy * math.sin(rot)
+            dy_r = dx * math.sin(rot) + dy * math.cos(rot)
+            corrected_rot.append((dx_r, dy_r))
+    else:
+        corrected_rot = corrected[:]   # asegurar que son sólo tuplas (dx, dy)
+
+    # ============================================================
+    # CONVERTIR A LAT/LON Y GUARDAR
+    # ============================================================
 
     # ============================================================
     # CONVERTIR A LAT/LON Y GUARDAR
     # ============================================================
 
     registros = []
-    for (dx_c, dy_c), p in zip(corrected, panels):
+    for (dx_c, dy_c), p in zip(corrected_rot, panels):
+        # dy_c = metros hacia el norte, dx_c = metros hacia el este
         dlat, dlon = deg_offsets_from_m(lat, dy_c, dx_c)
         registros.append({
             "id_panel": generar_id(),
@@ -363,6 +386,7 @@ def procesar_imagen(image_path, string_id, debug=False, rumbo=None):
             "conf": round(p["confidence"], 3),
             "image": os.path.basename(image_path)
         })
+
 
     # --------------------------------------
     # Guardar resultados
